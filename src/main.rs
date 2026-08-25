@@ -16,14 +16,62 @@ use windows_registry::{CURRENT_USER, LOCAL_MACHINE};
 // This function was discovered via Frida dynamic analysis. The original
 // unknowntrojan Rust patcher doesn't know about it (designed for v20).
 //
-// The fix: find the function prologue + first JNE, and convert that JNE
-// to an unconditional JMP so the function always takes the early-exit
-// success path, never reaching the dialog construction code.
+// The fix: find the function prologue + the first license-valid branch, and force
+// it down the early-exit success path so the function always reports a valid
+// license and never reaches the dialog construction code. The branch opcode and
+// offset differ between v21.0.0 (JNE -> JMP) and v21.0.4+ (JE -> NOP NOP).
 fn patch_v21_dialog(data: &mut [u8]) -> Result<(), PatchError> {
-    // This is the "Beta 3" pattern from resolvepatch_v2.py which successfully
-    // bypassed the license dialog in the current v21.0.0 build.
-    // It has two extra bytes (33 C9 = xor ecx,ecx) compared to the original v21 pattern,
-    // which shifts the JNE (0F 85) to offset 24 instead of 22.
+    // DaVinci Resolve 21.0.4+ recompiled the license-check chain function, so the
+    // original v21.0.0 "Beta 3" pattern no longer matches. The v21.0.4 function
+    // reads a license-valid flag byte and either returns 1 (valid) or falls into the
+    // "Checking Licenses" box + activation dialog:
+    //
+    //   40 53                push rbx
+    //   48 81 EC 80 00 00 00 sub  rsp, 0x80
+    //   E8 ?? ?? ?? ??       call license-flag getter
+    //   84 C0                test al, al
+    //   74 0B                je   +0xb   (flag == 0 -> dialog path)
+    //   B0 01                mov  al, 1   (return "licensed")
+    //   48 81 C4 80 00 00 00 add  rsp, 0x80
+    //   5B C3                pop  rbx; ret
+    //
+    // Turning the JE (74 0B) into NOP NOP makes the function always return 1,
+    // never reaching the dialog path.
+    let occs: Vec<usize> = coolfindpattern::PatternSearcher::new(
+        &data,
+        pattern!(
+            0x40, 0x53,
+            0x48, 0x81, 0xEC, 0x80, 0x00, 0x00, 0x00,
+            0xE8, _, _, _, _,
+            0x84, 0xC0,
+            0x74, 0x0B,
+            0xB0, 0x01,
+            0x48, 0x81, 0xC4, 0x80, 0x00, 0x00, 0x00,
+            0x5B, 0xC3
+        ),
+    )
+    .collect();
+
+    match occs.len() {
+        1 => {
+            let addr = occs[0];
+            log::info!("v21 dialog bypass (v21.0.4+): patching at offset 0x{:08X}", addr);
+            data[addr + 16] = 0x90; // NOP (was JE)
+            data[addr + 17] = 0x90; // NOP
+            Ok(())
+        }
+        0 => patch_v21_dialog_v2100(data),
+        n => {
+            log::warn!("v21 dialog bypass: v21.0.4+ pattern matched {n} times — skipping");
+            Err(PatchError::SignatureOccurrenceMismatch(n))
+        }
+    }
+}
+
+/// Legacy v21.0.0 "Beta 3" pattern from resolvepatch_v2.py.
+/// It has two extra bytes (33 C9 = xor ecx,ecx) compared to the original v21 pattern,
+/// which shifts the JNE (0F 85) to offset 24 instead of 22.
+fn patch_v21_dialog_v2100(data: &mut [u8]) -> Result<(), PatchError> {
     let searcher = coolfindpattern::PatternSearcher::new(
         &data,
         pattern!(
@@ -41,14 +89,14 @@ fn patch_v21_dialog(data: &mut [u8]) -> Result<(), PatchError> {
     match occs.len() {
         0 => {
             log::warn!("v21 dialog bypass: pattern not found (may already be patched)");
-            return Ok(());
+            Ok(())
         }
         1 => {
             let addr = occs[0];
             // Replace bytes 24-25 (0F 85 = JNE) with (90 E9 = NOP + JMP)
             // Bytes 26-29 (the rel32 displacement) are left intact,
             // so the JMP lands exactly where the JNE would have.
-            log::info!("v21 dialog bypass: patching at offset 0x{:08X}", addr);
+            log::info!("v21 dialog bypass (v21.0.0): patching at offset 0x{:08X}", addr);
             data[addr + 24] = 0x90; // NOP
             data[addr + 25] = 0xE9; // JMP rel32
             // bytes 26..30 stay as-is (original displacement)
